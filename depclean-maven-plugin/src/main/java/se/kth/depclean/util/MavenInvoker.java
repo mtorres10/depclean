@@ -18,19 +18,11 @@
 package se.kth.depclean.util;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
-import java.util.Collections;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.maven.shared.invoker.DefaultInvocationRequest;
-import org.apache.maven.shared.invoker.DefaultInvoker;
-import org.apache.maven.shared.invoker.InvocationRequest;
-import org.apache.maven.shared.invoker.InvocationResult;
-import org.apache.maven.shared.invoker.Invoker;
-import org.apache.maven.shared.invoker.MavenInvocationException;
 
 /**
  * Utility class to execute Maven tasks from the command line.
@@ -50,16 +42,15 @@ public final class MavenInvoker {
    * @throws InterruptedException In case of IO issues.
    */
   public static String[] runCommand(String cmd) throws IOException, InterruptedException {
-    String os = System.getProperty("os.name").toLowerCase();
     Process process;
     ArrayList<String> list;
-    if (isUnix(os)) {
+    if (OsUtils.isUnix()) {
       list = new ArrayList<>();
       process = Runtime.getRuntime().exec(cmd);
       InputStream inputStream = process.getInputStream();
       BufferedReader br = new BufferedReader(new InputStreamReader(inputStream));
       return outputToConsole(process, list, br);
-    } else if (isWindows(os)) {
+    } else if (OsUtils.isWindows()) {
       list = new ArrayList<>();
       process = Runtime.getRuntime().exec("cmd /C " + cmd);
       BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream()));
@@ -80,33 +71,5 @@ public final class MavenInvoker {
     process.waitFor();
     br.close();
     return list.toArray(new String[0]);
-  }
-
-  /**
-   * This method invokes Maven to execute a given goal programmatically instead of running a command directly as in
-   * {@link #runCommand(String)}.
-   *
-   * @param mvnHome Location of maven installation.
-   * @param pomPath Path to the pom of the project.
-   * @param mvnGoal The maven goal to execute.
-   * @return The exit code from the Maven invocation.
-   * @throws MavenInvocationException In case of any issue invoking maven.
-   */
-  public static int invokeMaven(String mvnHome, String pomPath, String mvnGoal) throws MavenInvocationException {
-    InvocationRequest request = new DefaultInvocationRequest();
-    request.setPomFile(new File(pomPath));
-    request.setGoals(Collections.singletonList(mvnGoal));
-    Invoker invoker = new DefaultInvoker();
-    invoker.setMavenHome(new File(mvnHome));
-    InvocationResult result = invoker.execute(request);
-    return result.getExitCode();
-  }
-
-  private static boolean isUnix(String os) {
-    return (os.contains("nix") || os.contains("nux") || os.contains("mac os"));
-  }
-
-  private static boolean isWindows(String os) {
-    return (os.contains("win"));
   }
 }

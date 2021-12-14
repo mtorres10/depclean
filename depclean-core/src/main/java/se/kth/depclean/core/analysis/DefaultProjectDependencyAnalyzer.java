@@ -20,32 +20,32 @@ package se.kth.depclean.core.analysis;
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
+import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.project.MavenProject;
 import org.codehaus.plexus.component.annotations.Component;
 import org.codehaus.plexus.component.annotations.Requirement;
+import org.codehaus.plexus.util.xml.Xpp3Dom;
 import se.kth.depclean.core.analysis.asm.ASMDependencyAnalyzer;
 import se.kth.depclean.core.analysis.graph.DefaultCallGraph;
 
 /**
- * The principal class that perform the dependency analysis in a Maven project.
+ * This is principal class that perform the dependency analysis in a Maven project.
  */
+@Slf4j
 @Component(role = ProjectDependencyAnalyzer.class)
 public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyzer {
-
-  /**
-   * If true, the project's classes in target/test-classes are not going to be analyzed.
-   */
-  private final boolean isIgnoredTest;
 
   @Requirement
   private final ClassAnalyzer classAnalyzer = new DefaultClassAnalyzer();
@@ -53,6 +53,19 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
   @Requirement
   private final DependencyAnalyzer dependencyAnalyzer = new ASMDependencyAnalyzer();
 
+  /**
+   * If true, the project's classes in target/test-classes are not going to be analyzed.
+   */
+  private final boolean isIgnoredTest;
+
+  /**
+   * A map [artifact] -> [allTypes].
+   */
+  private Map<Artifact, Set<String>> artifactClassesMap;
+
+  /**
+   * A map [artifact] -> [usedTypes].
+   */
   private final Map<Artifact, Set<String>> artifactUsedClassesMap = new HashMap<>();
 
   /**
@@ -63,11 +76,6 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
   }
 
   /**
-   * A map [dependency] -> [dependency classes].
-   */
-  private Map<Artifact, Set<String>> artifactClassesMap;
-
-  /**
    * Analyze the dependencies in a project.
    *
    * @param project The Maven project to be analyzed.
@@ -75,6 +83,7 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
    * @throws ProjectDependencyAnalyzerException if the analysis fails.
    * @see <code>ProjectDependencyAnalyzer#analyze(org.apache.invoke.project.MavenProject)</code>
    */
+  @Override
   public ProjectDependencyAnalysis analyze(MavenProject project) throws ProjectDependencyAnalyzerException {
     try {
       // a map of [dependency] -> [classes]
@@ -96,10 +105,11 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
       /* ******************** usage analysis ********************* */
 
       // search for the dependencies used by the project
-      Set<Artifact> usedArtifacts = collectUsedArtifacts(
+      collectUsedArtifacts(
           artifactClassesMap,
           DefaultCallGraph.referencedClassMembers(projectClasses)
       );
+      Set<Artifact> usedArtifacts = collectUsedArtifactsFromProcessors(project, artifactClassesMap);
 
       /* ******************** results as statically used at the bytecode *********************** */
 
@@ -119,6 +129,47 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
     } catch (IOException exception) {
       throw new ProjectDependencyAnalyzerException("Cannot analyze dependencies", exception);
     }
+
+  }
+
+  /**
+   * Maven processors are defined like this.
+   * <pre>{@code
+   *       <plugin>
+   *         <groupId>org.bsc.maven</groupId>
+   *         <artifactId>maven-processor-plugin</artifactId>
+   *         <executions>
+   *           <execution>
+   *             <id>process</id>
+   *             [...]
+   *             <configuration>
+   *               <processors>
+   *                 <processor>XXXProcessor</processor>
+   *               </processors>
+   *             </configuration>
+   *           </execution>
+   *         </executions>
+   *       </plugin>
+   * }</pre>
+   *
+   * @param project            the maven project
+   * @param artifactClassesMap previously built artifacts map
+   * @return all used artifacts so far
+   */
+  private Set<Artifact> collectUsedArtifactsFromProcessors(MavenProject project,
+      Map<Artifact, Set<String>> artifactClassesMap) {
+    final Xpp3Dom[] processors = Optional.ofNullable(project.getPlugin("org.bsc.maven:maven-processor-plugin"))
+        .map(plugin -> plugin.getExecutionsAsMap().get("process"))
+        .map(exec -> (Xpp3Dom) exec.getConfiguration())
+        .map(config -> config.getChild("processors"))
+        .map(Xpp3Dom::getChildren)
+        .orElse(new Xpp3Dom[0]);
+    Arrays.stream(processors)
+        .forEach(processor -> findArtifactForClassName(artifactClassesMap, processor.getValue())
+            .ifPresent(artifact -> artifactUsedClassesMap.putIfAbsent(artifact, new HashSet<>()))
+        );
+
+    return artifactUsedClassesMap.keySet();
   }
 
   /**
@@ -173,30 +224,38 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
     collectDependencyClasses(dependenciesDirectory);
   }
 
-  private Set<Artifact> collectUsedArtifacts(Map<Artifact, Set<String>> artifactClassMap,
+  /**
+   * Determine the artifacts that are used.
+   *
+   * @param artifactClassMap  A map of [artifact] -> [classes in the artifact].
+   * @param referencedClasses A set of classes that are detected as used.
+   * @return The set of used artifacts.
+   */
+  private Set<Artifact> collectUsedArtifacts(
+      Map<Artifact, Set<String>> artifactClassMap,
       Set<String> referencedClasses) {
     Set<Artifact> usedArtifacts = new HashSet<>();
-    // find for used members in each class in the dependency classes
     for (String clazz : referencedClasses) {
-      Artifact artifact = findArtifactForClassName(artifactClassMap, clazz);
-      if (artifact != null) {
-        if (!artifactUsedClassesMap.containsKey(artifact)) {
-          artifactUsedClassesMap.put(artifact, new HashSet<>());
+      Optional<Artifact> artifact = findArtifactForClassName(artifactClassMap, clazz);
+      if (artifact.isPresent()) {
+        if (!artifactUsedClassesMap.containsKey(artifact.get())) {
+          artifactUsedClassesMap.put(artifact.get(), new HashSet<>());
         }
-        artifactUsedClassesMap.get(artifact).add(clazz);
-        usedArtifacts.add(artifact);
+        artifactUsedClassesMap.get(artifact.get()).add(clazz);
+        usedArtifacts.add(artifact.get());
       }
     }
     return usedArtifacts;
   }
 
-  private Artifact findArtifactForClassName(Map<Artifact, Set<String>> artifactClassMap, String className) {
+
+  private Optional<Artifact> findArtifactForClassName(Map<Artifact, Set<String>> artifactClassMap, String className) {
     for (Map.Entry<Artifact, Set<String>> entry : artifactClassMap.entrySet()) {
       if (entry.getValue().contains(className)) {
-        return entry.getKey();
+        return Optional.of(entry.getKey());
       }
     }
-    return null;
+    return Optional.empty();
   }
 
   /**
@@ -230,24 +289,26 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
   }
 
   /**
-   * Computes a map of artifacts and their types.
+   * Computes a map of [artifact] -> [allTypes, usedTypes].
    *
-   * @return A map of artifact -> classes
+   * @return A map of [artifact] -> [allTypes, usedTypes]
    */
   public Map<String, ArtifactTypes> getArtifactClassesMap() {
     Map<String, ArtifactTypes> output = new HashMap<>();
     for (Map.Entry<Artifact, Set<String>> entry : artifactClassesMap.entrySet()) {
       Artifact key = entry.getKey();
       if (artifactUsedClassesMap.containsKey(key)) {
-        output.put(key.toString(), new ArtifactTypes(
-            artifactClassesMap.get(key), // get all the types
-            artifactUsedClassesMap.get(key) // get used types
-        ));
+        output.put(key.toString(),
+            new ArtifactTypes(
+                artifactClassesMap.get(key), // get all the types
+                artifactUsedClassesMap.get(key) // get used types
+            ));
       } else {
-        output.put(key.toString(), new ArtifactTypes(
-            artifactClassesMap.get(key), // get all the types
-            new HashSet<>() // get used types
-        ));
+        output.put(key.toString(),
+            new ArtifactTypes(
+                artifactClassesMap.get(key), // get all the types
+                new HashSet<>() // get used types
+            ));
       }
     }
     return output;
